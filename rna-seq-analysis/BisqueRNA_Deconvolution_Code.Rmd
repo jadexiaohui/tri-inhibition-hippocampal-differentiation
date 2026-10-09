@@ -1,0 +1,260 @@
+---
+title: "Deconvolution with BisqueRNA - Estimation of Hippocampal Cell Types"
+output: html_notebook
+---
+
+```{r}
+# Import libraries required
+library(Matrix)
+library(Biobase)
+library(BisqueRNA)
+library(ggplot2)
+library(reshape2)
+library(stringr)
+library(RColorBrewer)
+```
+
+
+```{r}
+# 1. Read snRNA reference: counts matrix + metadata
+dl <- file.path(Sys.getenv("USERPROFILE"), "Downloads")
+
+counts <- t(readMM(file.path(dl, "adata_reference_matrix.mtx")))  # genes x cells
+counts <- as(counts, "CsparseMatrix")
+obs <- read.delim(file.path(dl, "adata_reference_barcodes.tsv"),
+                  header = TRUE, row.names = 1)
+var <- read.delim(file.path(dl, "adata_reference_features.tsv"),
+                  header = TRUE, row.names = 1)
+```
+
+
+```{r}
+# To inspect structure of snRNA reference data
+dim(obs)
+str(obs)
+colnames(obs)
+head(obs)
+
+sapply(obs, function(x) length(unique(x)))
+```
+
+
+```{r}
+dim(counts)   # should be genes x cells  
+nrow(obs)     # number of cells — should equal ncol(counts)
+nrow(var)     # number of genes — should equal nrow(counts)
+```
+
+
+```{r}
+samp_meta <- unique(obs[, c("Sample","AgeGroup_5","Sex","Age","Batch")])
+rownames(samp_meta) <- samp_meta$Sample
+samp_meta <- samp_meta[colnames(pb), ]
+identical(rownames(samp_meta), colnames(pb))  
+```
+
+
+```{r}
+# 2. Import Bulk RNA-samples: genes x samples
+bulk <- read.delim(file.path(dl, "gene_count_matrix_hippo.txt"),
+                   row.names = 1, check.names = FALSE)
+
+bulk.matrix <- as.matrix(bulk)
+
+dim(bulk.matrix)
+colnames(bulk.matrix)
+
+bulk.eset <- ExpressionSet(assayData = bulk.matrix)
+```
+
+```{r}
+# 3. Use BisqueRNA to estimate proportion of cell types
+
+res <- ReferenceBasedDecomposition(
+  bulk.eset = bulk.eset,
+  sc.eset = sc.eset,
+  markers = NULL,        # optional marker gene list
+  use.overlap = FALSE    # In this case, we use FALSE as there are no cohort overlaps
+)
+
+# Estimated proportions: cell types x bulk samples
+est_props <- res$bulk.props
+est_props[1:5, 1:5]   
+```
+
+```{r}
+# To inspect cell types
+rownames(est_props)
+```
+
+
+```{r}
+## To plot out all clusters (cell types)
+
+# Reshape dataset
+df <- melt(est_props, varnames = c("CellType", "Sample"), value.name = "Proportion")
+df$Sample <- as.character(df$Sample)
+
+# Map cell types clusters to show (the rest will go to "Others")
+keep <- c("Astrocytes", "CA1", "CA2/MC", "CA3.1", "CA3.2", "Cajal-Retzius",
+          "Choroid Plexus", "GABA.N", "GC", "HATA/AHi", "L2/3", "L5",
+          "L6/6b", "ProS/Sub", "Microglia", "Oligodendrocytes", "OPC", "Ependymal", "Endothelial")
+
+print(sort(unique(trimws(as.character(df$CellType)))))
+
+ct <- trimws(as.character(df$CellType))
+
+# Match on make.names() versions so "CA2/MC" and "CA2.MC" both count
+lookup <- setNames(keep, make.names(keep))
+mapped <- unname(lookup[make.names(ct)])
+
+# Merge subclusters into their family
+mapped[grepl("^Astro", ct)] <- "Astrocytes"
+mapped[grepl("^GC", ct)]    <- "GC"
+
+df$CellType <- ifelse(is.na(mapped), "Others", mapped)
+df <- aggregate(Proportion ~ CellType + Sample, data = df, FUN = sum)
+
+# Get DIVs from bulk sample names
+div <- as.numeric(str_extract(df$Sample, "(?<=DIV)\\d+"))
+
+# DIV numbers that have an extra "1" in sample names
+div_fix <- c("1001" = 100, "111" = 11)
+hit <- as.character(div) %in% names(div_fix)
+div[hit] <- div_fix[as.character(div[hit])]
+
+# Assign DIVs to culture stages
+div_to_group <- c(
+  "0"   = 1,
+  "11"  = 2,
+  "40"  = 3,
+  "60"  = 4, "110" = 4,
+  "82"  = 5, "84" = 5, "100" = 5,
+  "154" = 6, "180" = 6, "200" = 6
+)
+df$Group <- unname(div_to_group[as.character(div)])
+
+if (any(is.na(df$Group))) {
+  warning("Unmapped DIV values: ", paste(unique(div[is.na(df$Group)]), collapse = ", "))
+}
+
+df$Group <- factor(df$Group, levels = 1:6,
+                   labels = c("G1: DIV0", "G2: DIV11", "G3: DIV40",
+                              "G4: DIV60", "G5: DIV82-100", "G6: DIV154-200"))
+
+# Average across replicates within culture stages
+df_grp <- aggregate(Proportion ~ CellType + Group, data = df, FUN = mean)
+
+
+df_grp$CellType <- factor(df_grp$CellType, levels = c(keep, "Others"))
+
+# For colours
+pool <- c(RColorBrewer::brewer.pal(12, "Paired"),
+          RColorBrewer::brewer.pal(8, "Dark2")[1:7])
+
+n <- length(keep)
+cols <- if (n <= length(pool)) pool[seq_len(n)] else hcl.colors(n, palette = "Dynamic")
+
+pal <- c(setNames(cols, keep), "Others" = "#BDBDBD")
+
+# Plot by culture stages
+p_grp <- ggplot(df_grp, aes(x = Group, y = Proportion, fill = CellType)) +
+  geom_col(position = "stack", width = 0.85) +
+  scale_fill_manual(values = pal, drop = FALSE) +
+  scale_y_continuous(expand = c(0, 0), labels = scales::percent) +
+  labs(x = NULL, y = "Mean estimated proportion", fill = "Cell type") +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.x = element_blank(),
+    legend.key.size = unit(0.4, "cm")
+  )
+print(p_grp)
+```
+
+
+```{r}
+## To plot out important clusters (cell types) only
+
+# Reshape dataset
+df <- melt(est_props, varnames = c("CellType", "Sample"), value.name = "Proportion")
+df$Sample <- as.character(df$Sample)
+
+# Map cell types clusters to show (the rest will go to "Others")
+keep <- c("Astrocytes", "CA1", "CA2/MC", "CA3.1", "CA3.2", "Cajal-Retzius",
+          "Choroid Plexus", "GABA.N", "GC", "HATA/AHi", "L2/3", "L5",
+          "L6/6b", "ProS/Sub")
+
+print(sort(unique(trimws(as.character(df$CellType)))))
+
+ct <- trimws(as.character(df$CellType))
+
+# Match on make.names() versions so "CA2/MC" and "CA2.MC" both count
+lookup <- setNames(keep, make.names(keep))
+mapped <- unname(lookup[make.names(ct)])
+
+# Merge subclusters into their family
+mapped[grepl("^Astro", ct)] <- "Astrocytes"
+mapped[grepl("^GC", ct)]    <- "GC"
+
+df$CellType <- ifelse(is.na(mapped), "Others", mapped)
+df <- aggregate(Proportion ~ CellType + Sample, data = df, FUN = sum)
+
+# Get DIVs from bulk sample names
+div <- as.numeric(str_extract(df$Sample, "(?<=DIV)\\d+"))
+
+# DIV numbers that have an extra "1" in sample names
+div_fix <- c("1001" = 100, "111" = 11)
+hit <- as.character(div) %in% names(div_fix)
+div[hit] <- div_fix[as.character(div[hit])]
+
+# Assign DIVs to culture stages
+div_to_group <- c(
+  "0"   = 1,
+  "11"  = 2,
+  "40"  = 3,
+  "60"  = 4, "110" = 4,
+  "82"  = 5, "84" = 5, "100" = 5,
+  "154" = 6, "180" = 6, "200" = 6
+)
+df$Group <- unname(div_to_group[as.character(div)])
+
+if (any(is.na(df$Group))) {
+  warning("Unmapped DIV values: ", paste(unique(div[is.na(df$Group)]), collapse = ", "))
+}
+
+df$Group <- factor(df$Group, levels = 1:6,
+                   labels = c("G1: DIV0", "G2: DIV11", "G3: DIV40",
+                              "G4: DIV60", "G5: DIV82-100", "G6: DIV154-200"))
+
+# Average across replicates within culture stages
+df_grp <- aggregate(Proportion ~ CellType + Group, data = df, FUN = mean)
+
+
+df_grp$CellType <- factor(df_grp$CellType, levels = c(keep, "Others"))
+
+# For colours
+pool <- c(RColorBrewer::brewer.pal(12, "Paired"),
+          RColorBrewer::brewer.pal(8, "Dark2")[1:7])
+
+n <- length(keep)
+cols <- if (n <= length(pool)) pool[seq_len(n)] else hcl.colors(n, palette = "Dynamic")
+
+pal <- c(setNames(cols, keep), "Others" = "#BDBDBD")
+
+# Plot by culture stages
+p_grp <- ggplot(df_grp, aes(x = Group, y = Proportion, fill = CellType)) +
+  geom_col(position = "stack", width = 0.85) +
+  scale_fill_manual(values = pal, drop = FALSE) +
+  scale_y_continuous(expand = c(0, 0), labels = scales::percent) +
+  labs(x = NULL, y = "Mean estimated proportion", fill = "Cell type") +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.x = element_blank(),
+    legend.key.size = unit(0.4, "cm")
+  )
+print(p_grp)
+```
+
+
